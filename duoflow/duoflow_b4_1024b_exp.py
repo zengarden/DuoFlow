@@ -16,7 +16,7 @@ class DuoFlowB4Exp(MeanFlowB4ExpBase):
 
     @dataclass
     class WandbCfg(MeanFlowB4ExpBase.WandbCfg):
-        project: str = "imf_ablation"
+        project: str = "duoflow_release"
 
     wandb_cfg: WandbCfg = field(default_factory=WandbCfg)
 
@@ -34,6 +34,12 @@ class DuoFlowB4Exp(MeanFlowB4ExpBase):
             return 0.9999
 
     optimizer_cfg: OptimizerCfg = field(default_factory=OptimizerCfg)
+
+    @dataclass
+    class TrainCfg(MeanFlowB4ExpBase.TrainCfg):
+        epoch: int = 84 # add 4 warmup epochs
+
+    train_cfg: TrainCfg = field(default_factory=TrainCfg)
 
     @dataclass
     class LossCfg(MeanFlowB4ExpBase.LossCfg):
@@ -103,7 +109,7 @@ class UVLoss:
 
         cosine = dot_b / (v_b * t_b).clamp_min(1e-6).sqrt()
         # cosine = cosine.clamp(min=0.0, max=1.0)
-        kappa = 0.5 + 0.4999 * cosine  # .clamp(min=0.5, max=0.999)
+        kappa = 0.5 + 0.4999 * cosine
         return kappa.view(1, 1, 1, 1)
 
     def sample_time_steps(self, batch_size, device, dtype):
@@ -222,8 +228,6 @@ class UVLoss:
             valid_f = dt_is_valid.to(dtype=dudt.dtype)
             correction = ((t - r).float() * dudt * valid_f).to(dtype=u_cond.dtype)
 
-        # this is meanflow identity:  v = u + (t - r) * dudt
-        v_pred_compound = u_cond + correction.detach()
         cfg_target = self.cfg_omega * dzdt + (1 - self.cfg_omega) * v_unc.detach()
         cfg_time_mask = (t <= self.cfg_max_t) & (~unconditional_mask)
         kappa = self._compute_target_kappa(
@@ -249,65 +253,9 @@ class UVLoss:
         loss = u_loss_final + v_loss_final * v_loss_weight
 
         if is_print_step:
-            v_cond_mask = cfg_time_mask.view(-1)
-            v_unc_mask = torch.logical_not(cfg_time_mask).view(-1)
-
-            u_cond_mask = v_cond_mask
-            u_unc_mask = v_unc_mask
-
-            u_error = ((v_pred_compound - v_target.detach()) ** 2).reshape(bs, -1)
-            u_error_flat = torch.mean(u_error, dim=-1).detach()
-
-            zero_tensor = torch.tensor(0.0, device=u_error_flat.device)
-            u_cond = torch.sum(u_error_flat[u_cond_mask]) if u_cond_mask.any() else zero_tensor
-            u_unc = torch.sum(u_error_flat[u_unc_mask]) if u_unc_mask.any() else zero_tensor
-
-            v_error = ((v_cond - v_target.detach()) ** 2).reshape(bs, -1)
-            v_error_flat = torch.mean(v_error, dim=-1).detach()
-
-            v_cond = torch.sum(v_error_flat[v_cond_mask]) if v_cond_mask.any() else zero_tensor
-            v_unc = torch.sum(v_error_flat[v_unc_mask]) if v_unc_mask.any() else zero_tensor
-
-            u_cond = accelerator.reduce(u_cond)
-            u_unc = accelerator.reduce(u_unc)
-            v_cond = accelerator.reduce(v_cond)
-            v_unc = accelerator.reduce(v_unc)
-
-            nr_v_cond = accelerator.reduce(v_cond_mask.sum())
-            nr_v_unc = accelerator.reduce(v_unc_mask.sum())
-            nr_u_cond = accelerator.reduce(u_cond_mask.sum())
-            nr_u_unc = accelerator.reduce(u_unc_mask.sum())
-            nr_v_all = nr_v_cond + nr_v_unc
-            nr_u_all = nr_u_cond + nr_u_unc
-
-            u_cond_mean = u_cond / (nr_u_cond) if nr_u_cond > 0 else zero_tensor
-            u_unc_mean = u_unc / (nr_u_unc) if nr_u_unc > 0 else zero_tensor
-            v_cond_mean = v_cond / (nr_v_cond) if nr_v_cond > 0 else zero_tensor
-            v_unc_mean = v_unc / (nr_v_unc) if nr_v_unc > 0 else zero_tensor
-            u_all_mean = (u_cond + u_unc) / (nr_u_all) if nr_u_all > 0 else zero_tensor
-            v_all_mean = (v_cond + v_unc) / (nr_v_all) if nr_v_all > 0 else zero_tensor
-
-            kappa_mean = kappa.detach().float().mean().to(device=zero_tensor.device)
-            v_w_mean = v_loss_weight.detach().float().to(device=zero_tensor.device)
-
             return loss.mean(), {
-                "u_cond": u_cond_mean,
-                "u_unc": u_unc_mean,
-                "v_cond": v_cond_mean,
-                "v_unc": v_unc_mean,
-                # Explicit aliases for paper tables:
-                # residual_* uses the identity residual proxy (compound-vs-target error),
-                # traj_residual_* uses instantaneous-velocity-vs-target error.
-                "residual_all": u_all_mean,
-                "residual_cond": u_cond_mean,
-                "residual_unc": u_unc_mean,
-                "traj_residual_all": v_all_mean,
-                "traj_mismatch": v_all_mean,
-                "traj_mismatch_all": v_all_mean,
-                "traj_mismatch_cond": v_cond_mean,
-                "traj_mismatch_unc": v_unc_mean,
-                "target_kappa": kappa_mean,
-                "v_loss_weight": v_w_mean,
+                "u_loss": u_loss.mean(),
+                "v_loss": v_loss.mean(),
             }
         else:
             return loss.mean(), {}

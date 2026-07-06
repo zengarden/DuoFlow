@@ -1,22 +1,21 @@
 import math
 import os
+import random
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import partial
 
+import numpy as np
 import torch
 
-torch.multiprocessing.set_start_method("spawn", force=True)
+# torch.multiprocessing.set_start_method("spawn", force=True)
 import torch_fidelity
 from accelerate.utils import set_seed
 from diffusers.models import AutoencoderKL
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from omegaconf import OmegaConf
 from PIL import Image
-from tinyexp import RedisCfgMixin, TinyExp, dataclass, store_and_run_exp
-from tinyexp.dataset.sampler import InfiniteSampler
-from tinyexp.tiny_engine.accelerator import DDPAccelerator, HFAccelerator
-from tinyexp.utils.model_utils import update_ema
 from torch.func import jvp
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
@@ -24,12 +23,16 @@ from tqdm import tqdm
 
 from tiny_meanflow.dataset import LMDBLatentsDataset, RedisCachedImageFolder
 from tiny_meanflow.sit import SiT_models
+from tinyexp import LoggerCfgMixin, RedisCfgMixin, TinyExp, WandbCfgMixin, dataclass, store_and_run_exp
+from tinyexp.dataset.sampler import InfiniteSampler
+from tinyexp.tiny_engine.accelerator import DDPAccelerator, HFAccelerator
+from tinyexp.utils.model_utils import update_ema
 
 
 @dataclass
 class NeedPreparedCfg:
     data_dir: str = os.environ.get("MEANFLOW_DATA_DIR", "./data/imagenet/train_vae_latents_lmdb")
-    val_fid_statistics_path: str = os.path.join("./data/", "fid_stats/adm_in256_stats.npz")
+    val_fid_statistics_path: str = os.environ.get("MEANFLOW_FID_STATISTICS_PATH", "./data/adm_in256_stats.npz")
     # vae_ckpt_name_or_path: str = f"stabilityai/sd-vae-ft-ema"
     vae_ckpt_name_or_path: str = os.environ.get("MEANFLOW_VAE_CKPT", f"stabilityai/sd-vae-ft-ema")
     output_root: str = "./output/meanflow"
@@ -220,7 +223,7 @@ class Loss:
 
 
 @dataclass(repr=False)
-class MeanFlowExp(TinyExp, RedisCfgMixin):
+class MeanFlowExp(TinyExp, RedisCfgMixin, LoggerCfgMixin, WandbCfgMixin):
     output_root: str = NeedPreparedCfg.output_root
     mode: str = "train"  # or "val"
     num_worker: int = torch.cuda.device_count()  # Number of workers for the experiment
@@ -228,7 +231,7 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
 
     # ------------------------ override config ------------------------ #
     @dataclass
-    class RedisCacheCfg(RedisCfgMixin.RedisCacheCfg):
+    class RedisCacheCfg(RedisCfgMixin.RedisCfg):
         redis_cache_max_memory: int = 500
 
     @dataclass
@@ -238,7 +241,6 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
 
     @dataclass
     class DataloaderCfg:
-        # data_dir: str = "/data/aipack/data/imagenet/train_vae_latents_lmdb"
         data_dir: str = NeedPreparedCfg.data_dir
         val_fid_statistics_path: str = NeedPreparedCfg.val_fid_statistics_path
 
@@ -249,14 +251,21 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
         val_batch_size_per_device: int = 128
         val_fid_samples: int = 50000
 
-        def build_train_dataloader(self, accelerator, redis_cache_cfg) -> DataLoader:
+        def build_train_dataloader(self, accelerator, redis_cache_cfg, basic_seed) -> DataLoader:
             if redis_cache_cfg.redis_cache_enabled:
                 train_dataset = RedisCachedImageFolder(
-                    redis_ports=redis_cache_cfg.redis_cache_shard_ports, root=self.data_dir, flip_prob=0.5
+                    redis_ports=redis_cache_cfg.redis_cluster_ports, root=self.data_dir, flip_prob=0.5
                 )
             else:
                 train_dataset = LMDBLatentsDataset(self.data_dir, flip_prob=0.5)
-            sampler = InfiniteSampler(len(train_dataset), shuffle=True, accelerator=accelerator)
+
+            # def worker_init_fn(worker_id, rank):
+            #     seed = basic_seed + worker_id + rank * 1000
+            #     torch.manual_seed(seed)
+            #     random.seed(seed)
+            #     np.random.seed(seed)
+
+            sampler = InfiniteSampler(len(train_dataset), shuffle=True, seed=basic_seed, accelerator=accelerator)
             train_dataloader = DataLoader(
                 train_dataset,
                 batch_size=self.train_batch_size_per_device,
@@ -264,6 +273,7 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
                 pin_memory=True,
                 drop_last=True,
                 sampler=sampler,
+                # worker_init_fn=partial(worker_init_fn, rank=accelerator.rank),
             )
             return train_dataloader
 
@@ -319,7 +329,24 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
         def _load_model(self, model, ckpt_path, logger):
             if ckpt_path is not None and ckpt_path != "":
                 logger.info(f"==> Loading model from {ckpt_path}")
-                state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)["ema"]
+                if ckpt_path.startswith("hf://"):
+                    from huggingface_hub import hf_hub_download
+                    from safetensors.torch import load_file
+
+                    repo_and_file = ckpt_path[5:]
+                    parts = repo_and_file.split("/", 2)
+                    if len(parts) != 3:
+                        raise ValueError("Hugging Face checkpoint must use hf://namespace/repo/filename")
+                    repo_id = "/".join(parts[:2])
+                    filename = parts[2]
+                    ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                    state_dict = load_file(ckpt_path, device="cpu")
+                elif ckpt_path.endswith(".safetensors"):
+                    from safetensors.torch import load_file
+
+                    state_dict = load_file(ckpt_path, device="cpu")
+                else:
+                    state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)["ema"]
                 model.load_state_dict(state_dict)
             else:
                 logger.info("==> No checkpoint path is provided. Training model from scratch.")
@@ -360,10 +387,10 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
         num_steps: int = 1
 
     @dataclass
-    class WandbCfg(TinyExp.WandbCfg):
+    class WandbCfg(WandbCfgMixin.WandbCfg):
         enable_wandb: bool = True
         entity: str = "lizeming"
-        project: str = "mf_ablation"
+        project: str = "duoflow_release"
 
     # ------------------------ instantiation of config --------------------------------- #
     redis_cache_cfg: RedisCacheCfg = field(default_factory=RedisCacheCfg)
@@ -387,13 +414,15 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
         if module is None:
             module = self.module_cfg.build_model(dataloader_cfg, logger)
             epoch = self.val_cfg.epoch
-            if epoch > -1:
-                ckpt_path = os.path.join(os.path.dirname(output_dir), "train", f"checkpoints/{epoch:07d}.pt")
-            elif epoch == -1:
-                ckpt_path = os.path.join(os.path.dirname(output_dir), "train", f"checkpoints/best.pt")
-            else:
-                accelerator.print("==> No validation epoch is provided. eval model from best checkpoint.")
+            if self.module_cfg.ckpt_path != "":
                 ckpt_path = self.module_cfg.ckpt_path
+                accelerator.print("==> Eval model from {}.".format(ckpt_path))
+            else:
+                if epoch > -1:
+                    ckpt_path = os.path.join(os.path.dirname(output_dir), "train", f"checkpoints/{epoch:07d}.pt")
+                elif epoch == -1:
+                    accelerator.print("==> No validation epoch is provided. eval model from best checkpoint.")
+                    ckpt_path = os.path.join(os.path.dirname(output_dir), "train", f"checkpoints/best.pt")
             module_cfg._load_model(module, ckpt_path, logger=logger)
             module = module.to(accelerator.device)
 
@@ -537,7 +566,7 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
         if accelerator.is_main_process:
             os.makedirs(output_dir, exist_ok=True)
 
-        train_dataloader = self.dataloader_cfg.build_train_dataloader(accelerator, self.redis_cache_cfg)
+        train_dataloader = self.dataloader_cfg.build_train_dataloader(accelerator, self.redis_cache_cfg, seed)
         optimizer_cfg = self.optimizer_cfg
         ori_optimizer = optimizer_cfg.build_optimizer(ori_module, train_dataloader, accelerator)
         module, optimizer = accelerator.prepare(ori_module, ori_optimizer)
@@ -626,7 +655,10 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
                     for param_group in optimizer.param_groups:
                         param_group["lr"] = lr
 
-                if total_batch_size >= 1024 and global_step == 40 * steps_per_epoch:
+                if (
+                    total_batch_size >= 1024
+                    and global_step == (40 + self.optimizer_cfg.warmup_epochs) * steps_per_epoch
+                ):
                     for param_group in optimizer.param_groups:
                         param_group["lr"] /= 2.0
 
@@ -713,8 +745,8 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
                     if wandb_cfg.enable_wandb:
                         wandb_logger.log(wandb_logger_dict, step=global_step)
 
-                    # checkpoint_path = os.path.join(output_dir, f"checkpoints/{global_epoch:07d}.pt")
-                    checkpoint_path = os.path.join(output_dir, f"checkpoints/best.pt")
+                    checkpoint_path = os.path.join(output_dir, f"checkpoints/{global_epoch:07d}.pt")
+                    # checkpoint_path = os.path.join(output_dir, f"checkpoints/best.pt")
                     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
                     if fid < best_fid:
                         logger.info(f"=> Saving checkpoint to {checkpoint_path}")
@@ -735,6 +767,7 @@ class MeanFlowExp(TinyExp, RedisCfgMixin):
         accelerator = self.accelerator_cfg.build_accelerator()
         output_dir = os.path.join(self.output_root, self.exp_name + self.suffix, self.mode)
         # --------------------------- begin of execute ---------------------------
+        # seed = 42
         seed = 0
         logger = self.logger_cfg.build_logger(save_dir=output_dir, distributed_rank=accelerator.rank)
 

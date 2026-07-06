@@ -1,20 +1,16 @@
 [project]
-name = "tiny-meanflow"
+name = "DuoFlow"
 version = "0.0.1"
-description = "This is a template repository for Python projects that use uv for their dependency management."
+description = "DuoFlow: JVP-Free Finite-Difference Mean Flows for One-Step Image Generation"
 authors = [{ name = "LI Zeming", email = "zane.li@connect.ust.hk" }]
 readme = "README.md"
 keywords = ['python']
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.10,<3.11"
 classifiers = [
     "Intended Audience :: Developers",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
@@ -24,15 +20,15 @@ dependencies = [
     "pillow==11.3.0",
     "numpy==1.26.4",
     "tqdm==4.67.1",
-    "TinyExp==0.0.5",
+    "TinyExp[pytorch]==0.1.4",
     "torch-fidelity",
     "einops==0.8.1",
 ]
 
 [project.urls]
-Homepage = "https://zengarden.github.io/tiny-meanflow/"
-Repository = "https://github.com/zengarden/tiny-meanflow"
-Documentation = "https://zengarden.github.io/tiny-meanflow/"
+Repository = "https://github.com/zengarden/DuoFlow"
+# Homepage = "https://zengarden.github.io/tiny-meanflow/"
+# Documentation = "https://zengarden.github.io/tiny-meanflow/"
 
 [dependency-groups]
 dev = [
@@ -116,3 +112,10 @@ preview = true
 
 [tool.uv.sources]
 torch-fidelity = { git = "https://github.com/LTH14/torch-fidelity.git", branch = "master" }
+
+[tool.isort]
+profile = "black"
+line_length = 120
+py_version = 310
+known_first_party = "tinyexp"
+known_third_party = "wandb"
