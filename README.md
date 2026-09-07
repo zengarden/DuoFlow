@@ -60,7 +60,7 @@ Evaluate the SiT-B/4 checkpoint with two GPUs:
 accelerate launch --num_processes 2 \
   duoflow/duoflow_b4_1024b_exp.py \
   mode=val \
-  module_cfg.ckpt_path="hf://zengarden/DuoFlow/model.safetensors" \
+  module_cfg.ckpt_path="hf://zengarden/DuoFlow/sit-b4/model.safetensors" \
   dataloader_cfg.val_batch_size_per_device=32
 ```
 The SiT-B/4 command should produce approximately **9.2 FID** in the one-step setting.
